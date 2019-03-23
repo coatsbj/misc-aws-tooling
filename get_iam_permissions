@@ -1,0 +1,371 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import argparse
+import sys
+import time
+import json
+from subprocess import check_output, call
+from collections import OrderedDict
+
+import boto3
+
+TIMEOUT=600
+
+class Action:
+	def __init__(self, svcName, actionName, res):
+		self.serviceName = svcName
+		self.name = actionName
+		self.resources = res
+
+	def get_effective_resources(self):
+		if self.is_resource_wildcard():
+			return list("*")
+		return list(set(self.resources))
+
+	def is_resource_wildcard(self):
+		return "*" in self.resources
+
+	def set_resource_wildcard(self):
+		self.resources = list("*")
+		return self
+
+	def is_service_wildcard(self):
+		return self.name == "*"
+
+	def set_service_wildcard(self):
+		self.name = "*"
+		return self
+
+	def is_blanket_wildcard(self):
+		return self.is_resource_wildcard() and self.is_service_wildcard()
+
+	def add_resources(self, toAdd):
+		if self.is_resource_wildcard():
+			return self;
+		
+		if not isinstance(toAdd, list):
+			toAdd = list(toAdd)
+
+		if "*" in toAdd:
+			return self.set_resource_wildcard()
+		
+		for resource in toAdd:
+			if not resource in self.resources:
+				self.resources.append(resource)
+
+		return self
+
+class ServiceActions:
+	def __init__(self, svcName):
+		self.serviceName = svcName
+		self.actions = list()
+		self.is_blanketed = False
+
+	def is_wildcarded_service(self):
+		if not self.is_blanketed:
+			self.is_blanketed = len(filter(lambda a: a.is_blanket_wildcard(), self.actions)) > 0
+		return self.is_blanketed
+
+	def is_service_action(self, actionName):
+		return actionName.split(":")[0] == self.serviceName
+
+	def get_blanketed_resources(self):
+		resources = list()
+		wildcardActions = filter(lambda a: a.is_service_wildcard(), self.actions)
+		for a in wildcardActions:
+			if a.is_blanket_wildcard():
+				return list("*")
+			for r in a.resources:
+				if not r in resources:
+					resources.append(r)
+		return resources
+
+	def get_resource_independent_action_names(self):
+		return list(set(map(lambda a2: a2.name, filter(lambda a1: a1.is_resource_wildcard(), self.actions))))
+
+	def apply_actions(self, actions):
+		if self.is_wildcarded_service:
+			return self
+
+		for action in actions:
+			self.add_service_action(action)
+
+		return self
+
+	def add_service_action(self, action):
+		if action.serviceName != self.serviceName:
+			return self
+
+		if action.is_blanket_wildcard():
+			self.is_blanketed = True
+			return self
+		matchingActions = filter(lambda a: a.name == action.name, self.actions)
+		if len(matchingActions) == 0:
+			self.actions.append(action)
+		elif action.is_resource_wildcard():
+			matchingActions[0].set_resource_wildcard()
+		else:
+			matchingActions[0].add_resources(action.resources)
+
+		return self
+
+	def get_name_sorted_actions(self):
+		def getActionName(action):
+			return action.name
+
+		return sorted(self.actions, key = getActionName)
+
+
+def flatten_statement(statement, services):
+	# just supporting Allow for now
+	action = statement["Action"]
+	
+	if not isinstance(action, list):
+		actionName = action
+		action = list()
+		action.append(actionName)
+
+	actions = list()
+	for a in action:
+		resource = statement["Resource"]
+		if not isinstance(resource, list):
+			resourceName = resource
+			resource = list()
+			resource.append(resourceName)
+
+		if a == "*":
+			# For now just going to assume we don't have a * action on a * resource, or on multiple resource types
+			if resource[0] == "*":
+				svc = ServiceActions("*")
+				services["*"] = svc
+				svc.add_service_action(Action("*", "*", "*"))
+				continue
+			
+			actionServiceName = resource[0].split(":")[2]
+			actionActionName = "*"
+		else:
+			actionNameParts = a.split(":")
+			actionServiceName = actionNameParts[0]
+			actionActionName = actionNameParts[1]
+
+		# TODO: Much more complicated than below - need to replace resources when not resource-starred, etc.
+		# actionNameLen = len(actionActionName)
+		# if actionNameLen > 1 and actionActionName[actionNameLen-1:actionNameLen] == "*" and "*" in resource:
+		# 	actionNameStem = actionActionName[0:-1]
+		# 	actions = filter(lambda a2: a2[0:len(actionNameStem)] != actionNameStem, actions)
+
+		m = Action(actionServiceName, actionActionName, resource)
+
+		actions.append(m)
+
+		svc = services.get(m.serviceName)
+		if not svc:
+			svc = ServiceActions(m.serviceName)
+			services[m.serviceName] = svc
+
+		svc.add_service_action(m)
+
+	return actions
+
+
+def summarize_permissions(policyDocuments):
+	services = {}
+
+	for policyDoc in policyDocuments:
+		for statement in policyDoc["Statement"]:
+			flatten_statement(statement, services)
+
+	return services
+
+
+def get_summarized_permissions(actions):
+	result = {}
+	for action in actions:
+		result[action.name] = action.get_effective_resources()
+
+	return result
+
+
+def get_connection(region, profile, type):
+    if profile is None:
+        session = boto3.session.Session(region_name=region)
+    else:
+        session = boto3.session.Session(region_name=region, profile_name=profile)
+    return session.client(type)
+
+
+def go(region, profile, entityId, isUser):
+	iam = get_connection(region, profile, 'iam')
+
+	if isUser:
+		policyDocuments = get_policies_for_user(entityId, iam)
+	else:
+		policyDocuments = get_policies_for_roles([entityId], iam)
+
+	allowedServices = summarize_permissions(policyDocuments)
+
+	# TODO: Spit out JSON
+	permissionsBlock = OrderedDict()
+
+	# res = OrderedDict()
+	# res["evaluatedEntity"] = entityId
+	# res["entityType"] = isUser and "User" or "Role"
+	# res["permissions"] = permissionsBlock
+	res = {
+		"evaluatedEntity": entityId,
+		"entityType": isUser and "User" or "Role",
+		"permissions": permissionsBlock
+	}
+
+	# print("known svcs: " + ",".join(allowedServices.keys()))
+
+	for serviceName in allowedServices.keys():
+		svcPermissions = OrderedDict()
+		permissionsBlock[serviceName] = svcPermissions
+
+		svcActions = allowedServices[serviceName]
+
+		# print("processing service: {} - action count: {}".format(svcActions.serviceName, len(svcActions.actions)))
+
+		if svcActions.is_wildcarded_service():
+			svcPermissions["*"] = "*"
+		else:
+			blanketed = svcActions.get_blanketed_resources()
+			if len(blanketed) > 0:
+				svcPermissions["*"] = blanketed
+
+			noResPerms = svcActions.get_resource_independent_action_names()
+			for n in noResPerms:
+				svcPermissions[n] = "*"
+
+			for action in svcActions.get_name_sorted_actions():
+				if not action.is_resource_wildcard() and not action.is_service_wildcard():
+					svcPermissions[action.name] = action.get_effective_resources()
+
+	print(json.dumps(res, indent = 2, sort_keys = True))
+
+
+def get_policies_for_roles(roleNames, iam):
+	policyNames = list()
+	policyArns = list()
+	policyDocuments = list()
+
+	attachedPoliciesObj = { 
+		"policyArns": list(),
+		"policyDocuments": list()
+	}
+
+	for roleName in roleNames:
+		rolePolicyNames = iam.list_role_policies(RoleName=roleName)["PolicyNames"]
+		for policyName in rolePolicyNames:
+			if not policyName in policyNames:
+				policyNames.append(policyName)
+				rolePolicyDoc = iam.get_role_policy(RoleName=roleName, PolicyName=policyName)["PolicyDocument"]
+				policyDocuments.append(rolePolicyDoc)
+
+		attachedPolicyDefns = iam.list_attached_role_policies(RoleName=roleName)["AttachedPolicies"]
+		
+		attachedPoliciesObj = process_attached_policies(attachedPolicyDefns, attachedPoliciesObj, iam)
+
+	policyDocuments = policyDocuments + attachedPoliciesObj["policyDocuments"]
+	return policyDocuments
+
+def get_policies_for_user(userName, iam):
+	policyNames = list()
+	policyArns = list()
+	policyDocuments = list()
+
+	userPolicyNames = iam.list_user_policies(UserName=userName)["PolicyNames"]
+	for policyName in userPolicyNames:
+		if not policyName in policyNames:
+			policyNames.append(policyName)
+			userPolicyDoc = iam.get_user_policy(UserName=userName, PolicyName=policyName)["PolicyDocument"]
+			policyDocuments.append(userPolicyDoc)
+	
+	attachedPoliciesObj = { 
+		"policyArns": list(),
+		"policyDocuments": list()
+	}
+
+	attachedPolicyDefns = iam.list_attached_user_policies(UserName=userName)["AttachedPolicies"]
+
+	if len(attachedPolicyDefns):
+		attachedPoliciesObj = process_attached_policies(attachedPolicyDefns, attachedPoliciesObj, iam)
+
+	policyDocuments = policyDocuments + get_user_group_policies(userName, iam)
+
+	return policyDocuments
+
+def get_user_group_policies(userName, iam):
+	policyNames = list()
+	policyArns = list()
+	policyDocuments = list()
+
+	userGroups = iam.list_groups_for_user(UserName=userName)["Groups"]
+
+	if not len(userGroups):
+		return policyDocuments()
+
+	for group in userGroups:
+		groupName = group["GroupName"]
+		groupPolicyNames = iam.list_group_policies(GroupName=groupName)["PolicyNames"]
+
+		for policyName in groupPolicyNames:
+			if not policyName in policyNames:
+				policyNames.append(policyName)
+				groupPolicyDoc = iam.get_group_policy(GroupName=groupName, PolicyName=policyName)["PolicyDocument"]
+				policyDocuments.append(groupPolicyDoc)
+
+		attachedPolicyDefns = iam.list_attached_group_policies(GroupName=groupName)["AttachedPolicies"]
+
+		for policyDefn in attachedPolicyDefns:
+			policyArn = policyDefn["PolicyArn"]
+			
+			if not policyArn in policyArns:
+				policyArns.append(policyArn)
+				policyVersion = iam.get_policy(PolicyArn=policyArn)["Policy"]["DefaultVersionId"]
+				managedPolicyDoc = iam.get_policy_version(PolicyArn=policyArn, VersionId=policyVersion)["PolicyVersion"]["Document"]
+				policyDocuments.append(managedPolicyDoc)
+
+	return policyDocuments
+
+def process_attached_policies(attachedPolicyDefns, attachedPoliciesObj, iam):
+	if not len(attachedPolicyDefns):
+		return attachedPoliciesObj
+
+	attachedPolicies = attachedPoliciesObj
+
+	for policyDefn in attachedPolicyDefns:
+		policyArn = policyDefn["PolicyArn"]
+		
+		if policyArn in attachedPolicies["policyArns"]:
+			continue
+
+		attachedPolicies["policyArns"].append(policyArn)
+		policyVersion = iam.get_policy(PolicyArn=policyArn)["Policy"]["DefaultVersionId"]
+		managedPolicyDoc = iam.get_policy_version(PolicyArn=policyArn, VersionId=policyVersion)["PolicyVersion"]["Document"]
+		attachedPolicies["policyDocuments"].append(managedPolicyDoc)
+
+	return attachedPolicies
+
+def parse_args():
+	parser = argparse.ArgumentParser()
+	parser.add_argument('-d', '--dialog', action='store_true')
+	parser.add_argument('-a', '--alert', action='store_true')
+	parser.add_argument('--region', default='us-east-1')
+	parser.add_argument('-u', '--isUser', default=None)
+	parser.add_argument('--profile', default=None)
+	parser.add_argument('entity_id')
+	return parser.parse_args(sys.argv[1:])
+
+args = parse_args()
+region = args.region
+profile = args.profile
+entity_id = args.entity_id
+isUser = args.isUser and True
+
+go(region, profile, entity_id, isUser)
+
+
